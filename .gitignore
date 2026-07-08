@@ -9,3 +9,4 @@ dist/
 config.yaml
 .env
 .DS_Store
+.planning/

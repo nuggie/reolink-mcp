@@ -120,3 +120,7 @@ This is the same discipline as 02-03-PLAN.md Task 2 — no automated command exi
 ---
 *Phase: 02-full-observe-surface*
 *Completed: 2026-07-09 (Tasks 1-2; Task 3 checkpoint pending operator hardware verification)*
+
+## Self-Check: PASSED
+
+All created/modified files verified present on disk; all 5 commit hashes (`c90af56`, `c997fed`, `e7ae03a`, `a0ffa5c`, `8e42443`) verified present in `git log --oneline --all`.

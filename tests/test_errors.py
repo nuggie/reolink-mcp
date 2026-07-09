@@ -50,7 +50,7 @@ def test_session_limit_detected_from_raw_dict_repr():
 
 def test_privacy_mode_enabled():
     message = classify_reolink_error(
-        LoginPrivacyModeError(), "front_door", "192.168.1.10"
+        LoginPrivacyModeError("privacy mode is enabled"), "front_door", "192.168.1.10"
     )
 
     assert "privacy mode enabled" in message
@@ -61,7 +61,9 @@ def test_connection_error_exact_wording():
         ReolinkConnectionError("refused"), "garage", "192.168.1.44"
     )
 
-    assert message == "camera 'garage' unreachable at 192.168.1.44 — check power/network"
+    assert message == (
+        "camera 'garage' unreachable at 192.168.1.44 — check power/network"
+    )
 
 
 @pytest.mark.parametrize(

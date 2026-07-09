@@ -1,5 +1,6 @@
 """Observe tools (read-only): `list_cameras` and `get_snapshot` (Phase 1);
-more land in Phase 2.
+`get_device_info` and `get_capabilities` (Phase 2 Plan 1); more land in
+Phase 2 Plan 2.
 
 Tool functions here are plain, undecorated `async def`s — registration with
 `ToolAnnotations` happens explicitly in `tools/__init__.py`'s
@@ -14,11 +15,13 @@ from __future__ import annotations
 import asyncio
 import io
 from datetime import UTC, datetime
+from typing import Any
 
 from mcp.server.fastmcp import Context, Image
 from PIL import Image as PILImage
 from reolink_aio.exceptions import CredentialsInvalidError, LoginError, ReolinkError
 
+from reolink_mcp.capabilities import CAPABILITY_MAP, gate
 from reolink_mcp.errors import CameraError, classify_reolink_error
 
 
@@ -176,3 +179,68 @@ async def get_snapshot(camera: str, ctx: Context) -> tuple[str, Image]:
     )
 
     return (caption, Image(data=jpeg_bytes, format="jpeg"))
+
+
+async def get_device_info(
+    camera: str, ctx: Context, full: bool = False
+) -> dict[str, Any]:
+    """Model, firmware, hardware details for `camera`, read directly off the
+    already-connected `Host` — zero additional `reolink-aio` calls beyond
+    `manager.get()`'s own connect step, which already fetched every field
+    below via `get_host_data()` (RESEARCH.md Pattern 1). `full=True` adds
+    `is_nvr`/`is_battery`/`num_channels` (D-02).
+
+    `UnknownCameraError`/`CameraError` raised by `manager.get()` propagate
+    uncaught here — same discipline as `get_snapshot` (this function issues
+    no additional awaited host calls that can fail)."""
+    manager = ctx.request_context.lifespan_context.manager
+    handle = await manager.get(camera)
+    host, ch = handle.host, handle.channel
+
+    info: dict[str, Any] = {
+        "camera": camera,
+        "model": host.model,
+        "item_number": host.item_number(ch),
+        "firmware_version": host.sw_version,
+        "hardware_version": host.hardware_version,
+        "serial": host.serial(ch),
+        "mac_address": host.mac_address,
+        "manufacturer": host.manufacturer,
+        "configured_host": manager.configured_host(camera),
+        "channel": ch,
+    }
+    if full:
+        info["is_nvr"] = host.is_nvr
+        info["is_battery"] = host.is_battery
+        info["num_channels"] = host.num_channels
+    return info
+
+
+async def get_capabilities(
+    camera: str, ctx: Context, full: bool = False
+) -> dict[str, Any]:
+    """What `camera` supports, in neutral hardware-feature vocabulary
+    (D-11): one boolean per `CAPABILITY_MAP` key, built via
+    `capabilities.gate()` so the vocabulary is defined exactly once, plus
+    the dynamic `ai_detection_types` list. `full=True` additionally exposes
+    `raw_capabilities` (every raw capability string for the channel) and
+    `siren_schedule` (the separate "siren" capability governing the
+    out-of-scope `set_audio_alarm` feature — distinct from the curated
+    `siren` key's `siren_play` check, informational only, never in the
+    curated default).
+
+    Same zero-extra-I/O discipline as `get_device_info` — `manager.get()`'s
+    connect step already populated everything `host.supported()` reads."""
+    manager = ctx.request_context.lifespan_context.manager
+    handle = await manager.get(camera)
+    host, ch = handle.host, handle.channel
+
+    caps: dict[str, Any] = {
+        "camera": camera,
+        **{key: gate(handle, key) for key in CAPABILITY_MAP},
+        "ai_detection_types": host.ai_supported_types(ch),
+    }
+    if full:
+        caps["raw_capabilities"] = sorted(host.capabilities.get(ch, set()))
+        caps["siren_schedule"] = host.supported(ch, "siren")
+    return caps

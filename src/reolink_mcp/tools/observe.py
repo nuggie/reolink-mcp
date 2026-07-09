@@ -1,6 +1,6 @@
 """Observe tools (read-only): `list_cameras` and `get_snapshot` (Phase 1);
-`get_device_info` and `get_capabilities` (Phase 2 Plan 1); more land in
-Phase 2 Plan 2.
+`get_device_info` and `get_capabilities` (Phase 2 Plan 1); `get_states` and
+`get_recent_events` (Phase 2 Plan 2).
 
 Tool functions here are plain, undecorated `async def`s — registration with
 `ToolAnnotations` happens explicitly in `tools/__init__.py`'s
@@ -174,8 +174,7 @@ async def get_snapshot(camera: str, ctx: Context) -> tuple[str, Image]:
     jpeg_bytes = out.getvalue()
 
     caption = (
-        f"{camera} — captured {datetime.now(UTC).isoformat()} — "
-        f"{im.width}x{im.height}"
+        f"{camera} — captured {datetime.now(UTC).isoformat()} — {im.width}x{im.height}"
     )
 
     return (caption, Image(data=jpeg_bytes, format="jpeg"))
@@ -244,3 +243,97 @@ async def get_capabilities(
         caps["raw_capabilities"] = sorted(host.capabilities.get(ch, set()))
         caps["siren_schedule"] = host.supported(ch, "siren")
     return caps
+
+
+def states_cmd_list(channel: int) -> dict[str, list[int]]:
+    """Narrow `cmd_list` for the roadmap `get_states`/`get_recent_events`
+    set — deliberately excludes `GetEnc`/`GetBatteryInfo`/`GetZoomFocus`/etc.
+    that `host.get_states(cmd_list=None)` would otherwise also fetch,
+    keeping the HTTP payload small (HDWR-03's shared-session-friendliness,
+    threat T-02-02). `GetEvents`/`GetMdState`/`GetAiState` (motion + AI) are
+    fetched unconditionally by `host.get_states()` regardless of `cmd_list`
+    content (verified against reolink_aio 0.21.3's `get_states` source) — no
+    separate call is needed for `get_recent_events` (RESEARCH.md Pattern
+    3)."""
+    return {
+        "GetIsp": [channel],
+        "GetIrLights": [channel],
+        "GetWhiteLed": [channel],
+        "GetAudioAlarm": [channel],
+    }
+
+
+async def get_states(
+    camera: str, ctx: Context, refresh: bool = False, full: bool = False
+) -> dict[str, Any]:
+    """Current device state for `camera`: day/night mode, white LED/
+    spotlight, IR lights, siren capability, and plain motion flag, plus
+    `polled_at`/`age_seconds` staleness metadata (D-05).
+
+    Serves cached state by default (`refresh=False`); pass `refresh=True` to
+    force a fresh camera poll. The very first call for a camera in this
+    server process ALWAYS forces a poll regardless of `refresh` — a freshly
+    connected camera has never had `GetIsp`/`GetIrLights`/`GetWhiteLed`/
+    `GetAudioAlarm`/motion/AI fetched (`manager.get()`'s own
+    `get_host_data()` call does not include them), so skipping this guard
+    would silently report fabricated "off"/"not detected" defaults instead
+    of real state (Pitfall 1). `full=True` widens the poll to every
+    subsystem the camera reports (`cmd_list=None`) and always forces its own
+    refresh, regardless of `refresh` — a full-labeled response must never
+    secretly serve a stale narrow-poll cache.
+
+    Hardware-absent fields are marked `"unsupported"` via `capabilities.gate()`
+    (D-09) rather than silently omitted or fabricated as `False`. The siren
+    field reports only capability (`"supported"`/`"unsupported"`), never a
+    live on/off state — no such getter exists in `reolink-aio`; the siren is
+    a fire-and-forget trigger, not a queryable device state.
+
+    `UnknownCameraError` from `manager.get()` propagates uncaught (same
+    discipline as `get_snapshot`/`get_device_info`); poll failures from
+    `host.get_states(cmd_list=...)` are translated into a curated
+    `CameraError` via `classify_reolink_error` (T-02-01) instead of leaking
+    a raw exception."""
+    manager = ctx.request_context.lifespan_context.manager
+    handle = await manager.get(camera)
+    host, ch = handle.host, handle.channel
+
+    if refresh or full or handle.states_polled_at is None:
+        cmd_list = None if full else states_cmd_list(ch)
+        try:
+            await host.get_states(cmd_list=cmd_list)
+        except Exception as exc:
+            raise CameraError(
+                classify_reolink_error(exc, camera, manager.configured_host(camera))
+            ) from exc
+        handle.states_polled_at = datetime.now(UTC)
+
+    age = (datetime.now(UTC) - handle.states_polled_at).total_seconds()
+    result: dict[str, Any] = {
+        "camera": camera,
+        "day_night": host.daynight_state(ch)
+        if gate(handle, "day_night")
+        else "unsupported",
+        "white_led": (
+            {"on": host.whiteled_state(ch), "brightness": host.whiteled_brightness(ch)}
+            if gate(handle, "white_led")
+            else "unsupported"
+        ),
+        "ir_lights": host.ir_enabled(ch)
+        if gate(handle, "ir_lights")
+        else "unsupported",
+        "siren": "supported" if gate(handle, "siren") else "unsupported",
+        "motion": host.motion_detected(ch),
+        "polled_at": handle.states_polled_at.isoformat(),
+        "age_seconds": round(age, 1),
+    }
+    if full:
+        result["status_led"] = host.status_led_enabled(ch)
+        result["battery_percentage"] = (
+            host.battery_percentage(ch) if host.is_battery else None
+        )
+        result["audio_alarm_enabled"] = (
+            host.audio_alarm_enabled(ch)
+            if host.supported(ch, "siren")
+            else "unsupported"
+        )
+    return result

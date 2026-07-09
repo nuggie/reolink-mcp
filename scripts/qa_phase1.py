@@ -32,6 +32,7 @@ import base64
 import io
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -80,6 +81,15 @@ def preflight(env: dict[str, str]) -> list[str]:
         sys.exit(f"SETUP: {config_path} has no cameras")
     problems = []
     for name in cameras:
+        # Mirror the server's own name rule so the mistake surfaces here as
+        # one clear line instead of a startup traceback.
+        if not re.fullmatch(r"[a-z0-9_]+", name):
+            problems.append(
+                f"  camera name '{name}' must be lowercase snake_case "
+                f"(e.g. 'front_left') — rename it in config.yaml AND in "
+                f"the matching .env var"
+            )
+            continue
         var = f"RMCP_CAMERAS__{name}__PASSWORD"
         value = env.get(var, "")
         if not value:

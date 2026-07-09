@@ -31,7 +31,13 @@ async def list_cameras(ctx: Context) -> dict:
 
     async def _probe(name: str) -> dict:
         try:
-            async with asyncio.timeout(3):
+            # Safety net ABOVE the manager's own Host(timeout=10): real
+            # P437/P320 cold connects take >3s, so a tighter budget here
+            # preempts the manager's curated timeout error and cancels
+            # login mid-flight, leaking the Host's aiohttp session
+            # (found in Phase 1 hardware QA). This only fires if
+            # manager.get() hangs past its own internal timeout.
+            async with asyncio.timeout(12):
                 handle = await manager.get(name)
             return {
                 "name": name,

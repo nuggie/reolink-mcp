@@ -495,9 +495,24 @@ async def test_get_snapshot_sub_session_limit_raises_without_retrying_main(
 # ---------------------------------------------------------------------------
 
 
+def _per_channel_getter(mapping: dict[int | None, str | None]):
+    """Per-channel dict-backed getter mirroring reolink-aio's own
+    `Host.serial()`/`Host.item_number()` shape (`self._serial.get(channel)`)
+    — a real standalone camera only ever populates the `None` key, never a
+    numeric-channel key. Mirrors `_per_string_supported`'s per-argument
+    mocking discipline (above) so a channel-argument-sensitive bug cannot
+    hide behind a blanket `Mock(return_value=...)` (02-VERIFICATION.md
+    gap #1)."""
+    return lambda channel=None: mapping.get(channel)
+
+
 def _configure_device_info_mock(host) -> None:
     """Set every Host attribute get_device_info reads, mirroring a real
-    GetDevInfo response (RESEARCH.md Pattern 1's accessor table)."""
+    GetDevInfo response (RESEARCH.md Pattern 1's accessor table). `serial`/
+    `item_number` use the real standalone-camera shape — only the `None` key
+    populated — proving get_device_info's `_standalone_channel_fallback`
+    across every test in this section, not just the two dedicated
+    regression tests below."""
     host.model = "RLC-810A"
     host.sw_version = "v3.1.0.123"
     host.hardware_version = "IPC_3816M"
@@ -506,8 +521,8 @@ def _configure_device_info_mock(host) -> None:
     host.is_nvr = False
     host.is_battery = False
     host.num_channels = 1
-    host.item_number = Mock(return_value="P437")
-    host.serial = Mock(return_value="00000000ABCDEF")
+    host.item_number = _per_channel_getter({None: "P437", 0: None})
+    host.serial = _per_channel_getter({None: "00000000ABCDEF", 0: None})
 
 
 async def test_get_device_info_returns_mapped_fields(
@@ -579,6 +594,45 @@ async def test_get_device_info_unknown_camera_raises_unknown_camera_error(
     message = str(exc_info.value)
     assert "garage" in message
     assert "front_door" in message
+
+
+async def test_get_device_info_serial_and_item_number_fall_back_when_standalone_channel_key_missing(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    """02-VERIFICATION.md gap #1 repro: a real standalone camera's
+    GetDevInfo response only ever populates the `None`-keyed cache — the
+    numeric-channel key (`0`) is never set. `host.serial(0)`/
+    `host.item_number(0)` must fall back to the `None` key, exactly like
+    `Host.camera_model()`'s own `not self.is_nvr` fallback precedent."""
+    host = mock_host_factory()
+    _configure_device_info_mock(host)
+    host.serial = _per_channel_getter({None: "ABC123SERIAL", 0: None})
+    host.item_number = _per_channel_getter({None: "P437-ITEM", 0: None})
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    info = await get_device_info("front_door", _fake_ctx(manager))
+
+    assert info["serial"] == "ABC123SERIAL"
+    assert info["item_number"] == "P437-ITEM"
+
+
+async def test_get_device_info_serial_does_not_fall_back_for_nvr_channel(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    """The standalone-camera fallback must never borrow an NVR parent's
+    serial onto a channel that genuinely has none — mirrors
+    `Host.camera_model()`'s own `not self.is_nvr` gate exactly."""
+    host = mock_host_factory()
+    _configure_device_info_mock(host)
+    host.is_nvr = True
+    host.serial = _per_channel_getter({None: "PARENT_NVR_SERIAL", 0: None})
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    info = await get_device_info("front_door", _fake_ctx(manager))
+
+    assert info["serial"] is None
 
 
 # ---------------------------------------------------------------------------

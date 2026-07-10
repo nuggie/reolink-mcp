@@ -51,6 +51,7 @@ async def test_read_only_unset_registers_control_tools_at_real_import(
     tools = await reolink_mcp.server.mcp.list_tools()
 
     # 6 observe tools + set_siren/set_spotlight/set_ir_lights/set_white_led
-    # (Task 2 of this plan) — Plan 03-02 will need its own count update when
-    # it adds the remaining five control tools.
-    assert len(tools) == 10
+    # (Phase 3 Plan 1) + set_zoom/list_presets/ptz_move_to_preset/
+    # ptz_position (Phase 3 Plan 2) — 8 of 9 control tools total; Plan 03-03
+    # will need its own count update when it adds the ninth, ptz_guard.
+    assert len(tools) == 14

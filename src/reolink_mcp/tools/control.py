@@ -1,5 +1,7 @@
 """Control tools (state-mutating): `set_siren` (Phase 3 Plan 1); `set_spotlight`,
-`set_ir_lights`, `set_white_led` (Phase 3 Plan 1, Task 2).
+`set_ir_lights`, `set_white_led` (Phase 3 Plan 1, Task 2); `set_zoom` (Phase 3
+Plan 2, Task 1); `list_presets`, `ptz_move_to_preset`, `ptz_position`
+(Phase 3 Plan 2, Task 2).
 
 Tool functions here are plain, undecorated `async def`s — registration with
 `ToolAnnotations` happens explicitly in `tools/__init__.py`'s
@@ -19,6 +21,7 @@ the accepted command with an explicit note instead.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Literal
 
 from mcp.server.fastmcp import Context
@@ -31,6 +34,24 @@ from reolink_mcp.errors import CameraError, classify_control_error
 # it — both validated BEFORE any host call.
 SIREN_DEFAULT_DURATION_S = 5
 SIREN_MAX_DURATION_S = 60
+
+# D-08/Pattern 3: relative zoom steps are computed as ~10% of the camera's
+# raw zoom range per step (read-then-absolute-set, never the continuous
+# ZoomInc/ZoomDec PTZ commands) — a reasonable conversational-nudge default,
+# adjustable if live P437 QA (Plan 03-03) finds it too coarse/fine.
+ZOOM_RELATIVE_STEP_PCT = 10
+
+# D-12/Pattern 4: set_ptz_command's "PtzCtrl" body does not start with "Set",
+# so send_setting()'s auto-refetch never fires for a preset move — an
+# explicit settle-wait + host.baichuan.get_ptz_position() re-poll is
+# required. No PTZ hardware exists yet to calibrate this against (flagged as
+# an assumption pending live confirmation, RESEARCH.md Pattern 4); anchored
+# to reolink-aio's own wait_before_get=3 convention for lights/zoom.
+PTZ_SETTLE_WAIT_S = 2
+
+# D-11/Assumption A5: raw pan/tilt units of "close enough" to a cached
+# preset position to report ptz_position's "at_preset" match.
+PTZ_POSITION_TOLERANCE = 40
 
 
 async def set_siren(
@@ -203,4 +224,184 @@ async def set_white_led(
             "on": host.whiteled_state(ch),
             "brightness": host.whiteled_brightness(ch),
         },
+    }
+
+
+async def set_zoom(
+    camera: str,
+    ctx: Context,
+    position: int | None = None,
+    step: int | None = None,
+) -> dict[str, Any]:
+    """Zoom `camera` via an absolute normalized position (0-100, 0=widest)
+    or a relative in/out step (D-08).
+
+    Exactly one of `position`/`step` must be given. Both modes resolve to
+    one deterministic read-then-absolute-`host.set_zoom()` call — never the
+    continuous `ZoomInc`/`ZoomDec` PTZ commands (Pattern 3) — so zoom control
+    stays on the same bounded, already-validated code path regardless of
+    which parameter the caller used. A relative step that would exceed the
+    camera's raw range is silently clamped (a low-friction, reversible
+    control, unlike the siren's refuse-not-clamp rule); an out-of-range
+    absolute `position` is refused before any host call."""
+    manager = ctx.request_context.lifespan_context.manager
+    handle = await manager.get(camera)
+    if not gate(handle, "zoom"):
+        raise CameraError(refusal_message(camera, "zoom"))
+    host, ch = handle.host, handle.channel
+
+    if (position is None) == (step is None):
+        raise CameraError(
+            f"camera '{camera}' set_zoom requires exactly one of position or step"
+        )
+
+    zrange = host.zoom_range(ch)["zoom"]
+    zmin, zmax = zrange["min"], zrange["max"]
+
+    if position is not None:
+        if position < 0 or position > 100:
+            raise CameraError(
+                f"camera '{camera}' zoom position {position} not in range 0..100"
+            )
+        raw = round(zmin + (zmax - zmin) * position / 100)
+    else:
+        current = host.get_zoom(ch)
+        raw_step = round((zmax - zmin) * ZOOM_RELATIVE_STEP_PCT / 100)
+        raw = min(max(current + step * raw_step, zmin), zmax)
+
+    try:
+        await host.set_zoom(ch, raw)
+    except Exception as exc:
+        raise CameraError(
+            classify_control_error(exc, camera, manager.configured_host(camera))
+        ) from exc
+
+    # host.set_zoom() itself calls send_setting(body, getcmd="GetZoomFocus",
+    # wait_before_get=3) — the state is already fresh, no extra poll needed
+    # (D-14, same discipline as the lights read-backs above).
+    final_raw = host.get_zoom(ch)
+    return {
+        "camera": camera,
+        "zoom": {
+            "raw": final_raw,
+            "position_pct": round((final_raw - zmin) / (zmax - zmin) * 100)
+            if zmax > zmin
+            else 0,
+            "range": {"min": zmin, "max": zmax},
+        },
+    }
+
+
+async def list_presets(camera: str, ctx: Context) -> dict[str, Any]:
+    """List `camera`'s named PTZ presets (CTRL-06).
+
+    `host.ptz_presets(ch)` is already populated at connect time (Pattern 1 —
+    `get_host_data()`'s second internal round-trip includes `GetPtzPreset`
+    whenever `ptz_preset_basic` is supported) — a pure, synchronous read,
+    zero extra host I/O beyond the manager's own connect."""
+    manager = ctx.request_context.lifespan_context.manager
+    handle = await manager.get(camera)
+    if not gate(handle, "ptz_presets"):
+        raise CameraError(refusal_message(camera, "ptz_presets"))
+    host, ch = handle.host, handle.channel
+
+    return {"camera": camera, "presets": host.ptz_presets(ch)}
+
+
+async def ptz_move_to_preset(
+    camera: str, ctx: Context, preset: str | int
+) -> dict[str, Any]:
+    """Move `camera` to a named PTZ preset, or a numeric ID for unnamed ones
+    (D-09).
+
+    An unknown preset name is refused BEFORE any host call, with a curated
+    error listing the available preset names (self-correcting error style,
+    mirroring the unknown-camera error). `set_ptz_command`'s `"PtzCtrl"` body
+    does not auto-refresh position (Pattern 4), so this tool explicitly
+    waits `PTZ_SETTLE_WAIT_S` for the camera to settle, then force-repolls
+    pan/tilt via `host.baichuan.get_ptz_position()` (Pattern 5) and writes
+    the observed position into the session-scoped `preset_positions` cache
+    (D-11's later `ptz_position` lookup, Pitfall 6)."""
+    manager = ctx.request_context.lifespan_context.manager
+    handle = await manager.get(camera)
+    if not gate(handle, "ptz_presets"):
+        raise CameraError(refusal_message(camera, "ptz_presets"))
+    host, ch = handle.host, handle.channel
+
+    presets = host.ptz_presets(ch)
+    if isinstance(preset, str) and preset not in presets:
+        names = ", ".join(sorted(presets))
+        raise CameraError(
+            f"camera '{camera}' has no preset '{preset}' — available "
+            f"presets: {names}"
+        )
+    preset_id = presets[preset] if isinstance(preset, str) else preset
+
+    try:
+        await host.set_ptz_command(ch, preset=preset_id)
+    except Exception as exc:
+        raise CameraError(
+            classify_control_error(exc, camera, manager.configured_host(camera))
+        ) from exc
+
+    await asyncio.sleep(PTZ_SETTLE_WAIT_S)
+    await host.baichuan.get_ptz_position(ch)
+
+    pan, tilt = host.ptz_pan_position(ch), host.ptz_tilt_position(ch)
+    if pan is not None and tilt is not None:
+        handle.preset_positions[preset_id] = (pan, tilt)
+
+    resolved_name = (
+        preset
+        if isinstance(preset, str)
+        else next((n for n, i in presets.items() if i == preset_id), None)
+    )
+    return {"camera": camera, "preset": resolved_name, "pan": pan, "tilt": tilt}
+
+
+async def ptz_position(camera: str, ctx: Context) -> dict[str, Any]:
+    """Read `camera`'s current pan/tilt/zoom position (D-11).
+
+    Pan/tilt is only reliably available via a forced re-poll —
+    `host.baichuan.get_ptz_position()` (Pattern 5) — never the HTTP-side
+    `GetPtzCurPos` path, whose capability gate depends on the Baichuan
+    subsystem's own discovery having already run. When the current position
+    is within `PTZ_POSITION_TOLERANCE` raw units of a previously-visited,
+    cached preset position, `"at_preset"` names that preset — raw numbers
+    alone are not meaningful in chat (D-11)."""
+    manager = ctx.request_context.lifespan_context.manager
+    handle = await manager.get(camera)
+    if not gate(handle, "pan_tilt"):
+        raise CameraError(refusal_message(camera, "pan_tilt"))
+    host, ch = handle.host, handle.channel
+
+    try:
+        await host.baichuan.get_ptz_position(ch)
+    except Exception as exc:
+        raise CameraError(
+            classify_control_error(exc, camera, manager.configured_host(camera))
+        ) from exc
+
+    pan, tilt = host.ptz_pan_position(ch), host.ptz_tilt_position(ch)
+    zoom_val: int | str = host.get_zoom(ch) if gate(handle, "zoom") else "unsupported"
+
+    at_preset = None
+    for preset_id, (cached_pan, cached_tilt) in handle.preset_positions.items():
+        if (
+            pan is not None
+            and tilt is not None
+            and abs(pan - cached_pan) <= PTZ_POSITION_TOLERANCE
+            and abs(tilt - cached_tilt) <= PTZ_POSITION_TOLERANCE
+        ):
+            at_preset = next(
+                (n for n, i in host.ptz_presets(ch).items() if i == preset_id), None
+            )
+            break
+
+    return {
+        "camera": camera,
+        "pan": pan,
+        "tilt": tilt,
+        "zoom": zoom_val,
+        "at_preset": at_preset,
     }

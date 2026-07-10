@@ -26,6 +26,7 @@ from reolink_mcp.tools.control import (
     set_siren,
     set_spotlight,
     set_white_led,
+    set_zoom,
 )
 from reolink_mcp.tools.observe import (
     get_capabilities,
@@ -104,5 +105,10 @@ def register_all(mcp: FastMCP, read_only: bool = False) -> None:
                 readOnlyHint=False, destructiveHint=False, idempotentHint=True
             )
         )(set_white_led)
+        mcp.tool(
+            annotations=ToolAnnotations(
+                readOnlyHint=False, destructiveHint=False, idempotentHint=False
+            )
+        )(set_zoom)
     else:
-        logger.warning("read-only mode: %d control tools disabled", 4)
+        logger.warning("read-only mode: %d control tools disabled", 5)

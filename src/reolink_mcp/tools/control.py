@@ -1,5 +1,6 @@
 """Control tools (state-mutating): `set_siren` (Phase 3 Plan 1); `set_spotlight`,
-`set_ir_lights`, `set_white_led` (Phase 3 Plan 1, Task 2).
+`set_ir_lights`, `set_white_led` (Phase 3 Plan 1, Task 2); `set_zoom` (Phase 3
+Plan 2, Task 1).
 
 Tool functions here are plain, undecorated `async def`s — registration with
 `ToolAnnotations` happens explicitly in `tools/__init__.py`'s
@@ -31,6 +32,12 @@ from reolink_mcp.errors import CameraError, classify_control_error
 # it — both validated BEFORE any host call.
 SIREN_DEFAULT_DURATION_S = 5
 SIREN_MAX_DURATION_S = 60
+
+# D-08/Pattern 3: relative zoom steps are computed as ~10% of the camera's
+# raw zoom range per step (read-then-absolute-set, never the continuous
+# ZoomInc/ZoomDec PTZ commands) — a reasonable conversational-nudge default,
+# adjustable if live P437 QA (Plan 03-03) finds it too coarse/fine.
+ZOOM_RELATIVE_STEP_PCT = 10
 
 
 async def set_siren(
@@ -202,5 +209,70 @@ async def set_white_led(
         "white_led": {
             "on": host.whiteled_state(ch),
             "brightness": host.whiteled_brightness(ch),
+        },
+    }
+
+
+async def set_zoom(
+    camera: str,
+    ctx: Context,
+    position: int | None = None,
+    step: int | None = None,
+) -> dict[str, Any]:
+    """Zoom `camera` via an absolute normalized position (0-100, 0=widest)
+    or a relative in/out step (D-08).
+
+    Exactly one of `position`/`step` must be given. Both modes resolve to
+    one deterministic read-then-absolute-`host.set_zoom()` call — never the
+    continuous `ZoomInc`/`ZoomDec` PTZ commands (Pattern 3) — so zoom control
+    stays on the same bounded, already-validated code path regardless of
+    which parameter the caller used. A relative step that would exceed the
+    camera's raw range is silently clamped (a low-friction, reversible
+    control, unlike the siren's refuse-not-clamp rule); an out-of-range
+    absolute `position` is refused before any host call."""
+    manager = ctx.request_context.lifespan_context.manager
+    handle = await manager.get(camera)
+    if not gate(handle, "zoom"):
+        raise CameraError(refusal_message(camera, "zoom"))
+    host, ch = handle.host, handle.channel
+
+    if (position is None) == (step is None):
+        raise CameraError(
+            f"camera '{camera}' set_zoom requires exactly one of position or step"
+        )
+
+    zrange = host.zoom_range(ch)["zoom"]
+    zmin, zmax = zrange["min"], zrange["max"]
+
+    if position is not None:
+        if position < 0 or position > 100:
+            raise CameraError(
+                f"camera '{camera}' zoom position {position} not in range 0..100"
+            )
+        raw = round(zmin + (zmax - zmin) * position / 100)
+    else:
+        current = host.get_zoom(ch)
+        raw_step = round((zmax - zmin) * ZOOM_RELATIVE_STEP_PCT / 100)
+        raw = min(max(current + step * raw_step, zmin), zmax)
+
+    try:
+        await host.set_zoom(ch, raw)
+    except Exception as exc:
+        raise CameraError(
+            classify_control_error(exc, camera, manager.configured_host(camera))
+        ) from exc
+
+    # host.set_zoom() itself calls send_setting(body, getcmd="GetZoomFocus",
+    # wait_before_get=3) — the state is already fresh, no extra poll needed
+    # (D-14, same discipline as the lights read-backs above).
+    final_raw = host.get_zoom(ch)
+    return {
+        "camera": camera,
+        "zoom": {
+            "raw": final_raw,
+            "position_pct": round((final_raw - zmin) / (zmax - zmin) * 100)
+            if zmax > zmin
+            else 0,
+            "range": {"min": zmin, "max": zmax},
         },
     }

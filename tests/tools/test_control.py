@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from mcp.server.fastmcp import FastMCP
-from reolink_aio.exceptions import ReolinkConnectionError
+from reolink_aio.exceptions import InvalidParameterError, ReolinkConnectionError
 
 from reolink_mcp.capabilities import refusal_message
 from reolink_mcp.errors import CameraError
@@ -28,6 +28,7 @@ from reolink_mcp.tools.control import (
     set_siren,
     set_spotlight,
     set_white_led,
+    set_zoom,
 )
 
 
@@ -66,6 +67,15 @@ def _configure_ir_lights_capable(host, *, raw_state: str = "Auto") -> None:
     host.set_ir_lights = AsyncMock()
     host.send_setting = AsyncMock()
     host._ir_settings = {0: {"state": raw_state}}
+
+
+def _configure_zoom_capable(
+    host, *, zmin: int = 0, zmax: int = 30, current: int = 10
+) -> None:
+    host.supported = _per_string_supported({"zoom": True})
+    host.zoom_range = lambda channel: {"zoom": {"min": zmin, "max": zmax}}
+    host.get_zoom = lambda channel: current
+    host.set_zoom = AsyncMock()
 
 
 # ---------------------------------------------------------------------------
@@ -370,19 +380,178 @@ async def test_set_ir_lights_gate_failure_calls_neither_setter(
 
 
 # ---------------------------------------------------------------------------
+# set_zoom (D-08, Pattern 3)
+# ---------------------------------------------------------------------------
+
+
+async def test_set_zoom_neither_position_nor_step_raises_without_host_call(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_zoom_capable(host)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    with pytest.raises(CameraError) as exc_info:
+        await set_zoom("front_door", _fake_ctx(manager))
+
+    assert "exactly one of position or step" in str(exc_info.value)
+    host.set_zoom.assert_not_awaited()
+
+
+async def test_set_zoom_both_position_and_step_raises_without_host_call(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_zoom_capable(host)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    with pytest.raises(CameraError) as exc_info:
+        await set_zoom("front_door", _fake_ctx(manager), position=50, step=1)
+
+    assert "exactly one of position or step" in str(exc_info.value)
+    host.set_zoom.assert_not_awaited()
+
+
+async def test_set_zoom_absolute_position_maps_into_raw_range(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_zoom_capable(host, zmin=0, zmax=30, current=10)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    await set_zoom("front_door", _fake_ctx(manager), position=50)
+
+    host.set_zoom.assert_awaited_once_with(0, 15)
+
+
+@pytest.mark.parametrize(("position", "expected_raw"), [(0, 0), (100, 30)])
+async def test_set_zoom_absolute_position_boundaries(
+    position, expected_raw, mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_zoom_capable(host, zmin=0, zmax=30, current=10)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    await set_zoom("front_door", _fake_ctx(manager), position=position)
+
+    host.set_zoom.assert_awaited_once_with(0, expected_raw)
+
+
+async def test_set_zoom_position_over_100_refused_without_host_call(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_zoom_capable(host, zmin=0, zmax=30, current=10)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    with pytest.raises(CameraError) as exc_info:
+        await set_zoom("front_door", _fake_ctx(manager), position=101)
+
+    assert "0..100" in str(exc_info.value)
+    host.set_zoom.assert_not_awaited()
+
+
+@pytest.mark.parametrize(("step", "expected_raw"), [(1, 13), (-1, 7)])
+async def test_set_zoom_relative_step_computed_from_range_pct(
+    step, expected_raw, mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_zoom_capable(host, zmin=0, zmax=30, current=10)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    await set_zoom("front_door", _fake_ctx(manager), step=step)
+
+    host.set_zoom.assert_awaited_once_with(0, expected_raw)
+
+
+async def test_set_zoom_relative_step_clamped_to_max_not_refused(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_zoom_capable(host, zmin=0, zmax=30, current=29)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    await set_zoom("front_door", _fake_ctx(manager), step=1)
+
+    host.set_zoom.assert_awaited_once_with(0, 30)
+
+
+async def test_set_zoom_gate_failure_refuses_without_awaiting(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    host.supported = _per_string_supported({"zoom": False})
+    host.set_zoom = AsyncMock()
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    with pytest.raises(CameraError) as exc_info:
+        await set_zoom("front_door", _fake_ctx(manager), position=50)
+
+    assert refusal_message("front_door", "zoom") in str(exc_info.value)
+    host.set_zoom.assert_not_awaited()
+
+
+async def test_set_zoom_success_returns_read_back_dict(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_zoom_capable(host, zmin=0, zmax=30, current=15)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    result = await set_zoom("front_door", _fake_ctx(manager), position=50)
+
+    assert result == {
+        "camera": "front_door",
+        "zoom": {"raw": 15, "position_pct": 50, "range": {"min": 0, "max": 30}},
+    }
+
+
+async def test_set_zoom_host_error_translated_to_camera_error(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_zoom_capable(host, zmin=0, zmax=30, current=10)
+    host.set_zoom = AsyncMock(
+        side_effect=InvalidParameterError("set_zoom: zoom value 15 not in range 0..30")
+    )
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    with pytest.raises(CameraError) as exc_info:
+        await set_zoom("front_door", _fake_ctx(manager), position=50)
+
+    assert "set_zoom" not in str(exc_info.value) or "rejected" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
 # Registration + RMCP_READ_ONLY (SAFE-02, D-13)
 # ---------------------------------------------------------------------------
 
 
-async def test_register_all_not_read_only_registers_ten_tools():
+async def test_register_all_not_read_only_registers_eleven_tools():
     test_mcp = FastMCP("probe-annotations")
     register_all(test_mcp, read_only=False)
 
     tools = await test_mcp.list_tools()
 
-    assert len(tools) == 10
+    assert len(tools) == 11
     names = {t.name for t in tools}
-    assert {"set_siren", "set_spotlight", "set_ir_lights", "set_white_led"} <= names
+    assert {
+        "set_siren",
+        "set_spotlight",
+        "set_ir_lights",
+        "set_white_led",
+        "set_zoom",
+    } <= names
 
 
 async def test_register_all_read_only_registers_six_tools_no_control_tools():
@@ -393,7 +562,13 @@ async def test_register_all_read_only_registers_six_tools_no_control_tools():
 
     assert len(tools) == 6
     names = {t.name for t in tools}
-    assert not {"set_siren", "set_spotlight", "set_ir_lights", "set_white_led"} & names
+    assert not {
+        "set_siren",
+        "set_spotlight",
+        "set_ir_lights",
+        "set_white_led",
+        "set_zoom",
+    } & names
 
 
 async def test_observe_tools_carry_full_d13_annotation_matrix():
@@ -448,3 +623,16 @@ async def test_low_friction_control_tools_registered_with_destructive_hint_false
     assert tool.annotations.readOnlyHint is False
     assert tool.annotations.destructiveHint is False
     assert tool.annotations.idempotentHint is True
+
+
+async def test_set_zoom_registered_with_idempotent_hint_false():
+    test_mcp = FastMCP("probe-annotations")
+    register_all(test_mcp, read_only=False)
+
+    tools = await test_mcp.list_tools()
+    tool = next(t for t in tools if t.name == "set_zoom")
+
+    assert tool.annotations is not None
+    assert tool.annotations.readOnlyHint is False
+    assert tool.annotations.destructiveHint is False
+    assert tool.annotations.idempotentHint is False

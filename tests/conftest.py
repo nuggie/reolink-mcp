@@ -30,6 +30,22 @@ _collection_stub_config = Path(_collection_stub_dir) / "config.yaml"
 _collection_stub_config.write_text("cameras: {}\n")
 os.environ["RMCP_CONFIG_FILE"] = str(_collection_stub_config)
 
+# The stub YAML alone is not enough: Settings also merges a repo-root `.env`
+# (env_file=".env", resolved against cwd — the dev-loop convenience noted in
+# `tmp_config` below). On a developer machine whose `.env` holds real
+# `RMCP_CAMERAS__<name>__PASSWORD` entries, those merge into the stub's empty
+# `cameras: {}` as orphan passwords and `load_settings()` exits with
+# "no camera named '<name>' in YAML" — during collection. Trigger the one
+# module-scope `load_settings()` (in `reolink_mcp.server`) now, with cwd
+# pointed at the stub dir where no `.env` exists; the module cache makes every
+# later collection-time import of `reolink_mcp.server` a no-op.
+_prev_cwd = os.getcwd()
+os.chdir(_collection_stub_dir)
+try:
+    import reolink_mcp.server  # noqa: F401
+finally:
+    os.chdir(_prev_cwd)
+
 from reolink_mcp.config import CameraConfig  # noqa: E402
 from reolink_mcp.manager import CameraManager  # noqa: E402
 

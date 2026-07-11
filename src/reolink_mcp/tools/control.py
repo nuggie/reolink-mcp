@@ -72,8 +72,13 @@ async def set_siren(
     `action="sound"` with no `duration` produces a short ~5s burst
     (`SIREN_DEFAULT_DURATION_S`); an explicit `duration` over
     `SIREN_MAX_DURATION_S` (60s) is refused with a clear error naming the
-    cap, never silently clamped. `action="stop"` silences an active siren
-    immediately. Calling `action="sound"` again while already sounding is
+    cap, never silently clamped. Zero/negative durations are likewise
+    refused before any host call — reolink-aio passes the value straight
+    through to the firmware as a raw `times` parameter, and what a camera
+    does with `times: 0` or a negative value is undefined and
+    model-dependent (refuse-not-clamp, both bounds). `action="stop"`
+    silences an active siren immediately.
+    Calling `action="sound"` again while already sounding is
     allowed (no refusal) — the camera's own firmware restarts the auto-off
     timer, no server-side code needed for that behavior (D-04).
 
@@ -103,6 +108,12 @@ async def set_siren(
         return {"camera": camera, "action": "stop", "duration": None, "note": note}
 
     resolved_duration = duration if duration is not None else SIREN_DEFAULT_DURATION_S
+    if resolved_duration < 1:
+        raise CameraError(
+            f"camera '{camera}' siren duration {resolved_duration}s must be "
+            f"at least 1s — zero/negative durations are never sent to the "
+            f"firmware"
+        )
     if resolved_duration > SIREN_MAX_DURATION_S:
         raise CameraError(
             f"camera '{camera}' siren duration {resolved_duration}s exceeds the "

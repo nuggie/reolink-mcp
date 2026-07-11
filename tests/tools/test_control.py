@@ -196,6 +196,27 @@ async def test_set_siren_sound_duration_61_refused_never_clamped(
     host.set_siren.assert_not_awaited()
 
 
+@pytest.mark.parametrize("duration", [0, -1])
+async def test_set_siren_sound_duration_below_one_refused_never_sent(
+    mock_host_factory, camera_config_factory, manager_factory, duration
+):
+    """WR-01: the lower bound is refused, not clamped — reolink-aio performs
+    no range check of its own and would hand the firmware a raw `times: 0`
+    or negative value with undefined, model-dependent behavior."""
+    host = mock_host_factory()
+    _configure_siren_capable(host)
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    with pytest.raises(CameraError) as exc_info:
+        await set_siren(
+            "front_door", _fake_ctx(manager), action="sound", duration=duration
+        )
+
+    assert "at least 1" in str(exc_info.value)
+    host.set_siren.assert_not_awaited()
+
+
 async def test_set_siren_stop_calls_enable_false_and_duration_none(
     mock_host_factory, camera_config_factory, manager_factory
 ):

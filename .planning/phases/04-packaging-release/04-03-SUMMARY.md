@@ -132,3 +132,7 @@ None yet from this plan directly -- `release.yml` cannot succeed on a real tag p
 ---
 *Phase: 04-packaging-release*
 *Completed: 2026-07-11*
+
+## Self-Check: PASSED
+
+All created/modified files confirmed present on disk (pyproject.toml, CHANGELOG.md, server.json, .github/workflows/release.yml, uv.lock, this SUMMARY.md). All 5 commits confirmed present in `git log --oneline --all` (0a870ed, 0facdd6, 72c521b, 74ea8e1, 7bc58e5).

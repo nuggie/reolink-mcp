@@ -307,7 +307,17 @@ async def set_zoom(
             f"camera '{camera}' set_zoom requires exactly one of position or step"
         )
 
-    zrange = host.zoom_range(ch)["zoom"]
+    # zoom_range()/get_zoom() are synchronous cache reads, but they RAISE
+    # (bare KeyError / InvalidParameterError) when _zoom_focus_settings was
+    # never populated — a condition distinct from supported(ch, "zoom"), so
+    # the gate() above does not preclude it. Wrapped like every other host
+    # interaction so no raw library text escapes to the client (T-02-01).
+    try:
+        zrange = host.zoom_range(ch)["zoom"]
+    except Exception as exc:
+        raise CameraError(
+            classify_control_error(exc, camera, manager.configured_host(camera))
+        ) from exc
     zmin, zmax = zrange["min"], zrange["max"]
 
     if position is not None:
@@ -317,21 +327,25 @@ async def set_zoom(
             )
         raw = round(zmin + (zmax - zmin) * position / 100)
     else:
-        current = host.get_zoom(ch)
+        try:
+            current = host.get_zoom(ch)
+        except Exception as exc:
+            raise CameraError(
+                classify_control_error(exc, camera, manager.configured_host(camera))
+            ) from exc
         raw_step = round((zmax - zmin) * ZOOM_RELATIVE_STEP_PCT / 100)
         raw = min(max(current + step * raw_step, zmin), zmax)
 
     try:
         await host.set_zoom(ch, raw)
+        # host.set_zoom() itself calls send_setting(body, getcmd="GetZoomFocus",
+        # wait_before_get=3) — the state is already fresh, no extra poll needed
+        # (D-14, same discipline as the lights read-backs above).
+        final_raw = host.get_zoom(ch)
     except Exception as exc:
         raise CameraError(
             classify_control_error(exc, camera, manager.configured_host(camera))
         ) from exc
-
-    # host.set_zoom() itself calls send_setting(body, getcmd="GetZoomFocus",
-    # wait_before_get=3) — the state is already fresh, no extra poll needed
-    # (D-14, same discipline as the lights read-backs above).
-    final_raw = host.get_zoom(ch)
     return {
         "camera": camera,
         "zoom": {
@@ -461,7 +475,20 @@ async def ptz_position(camera: str, ctx: Context) -> dict[str, Any]:
         ) from exc
 
     pan, tilt = host.ptz_pan_position(ch), host.ptz_tilt_position(ch)
-    zoom_val: int | str = host.get_zoom(ch) if gate(handle, "zoom") else "unsupported"
+
+    # get_zoom() raises when _zoom_focus_settings was never populated — a
+    # condition distinct from supported(ch, "zoom"), so the gate() alone does
+    # not preclude it. Zoom is a best-effort extra on this read-only tool:
+    # degrade to "unavailable" (raw detail at DEBUG, SAFE-03) rather than
+    # letting raw library text escape or failing a call whose pan/tilt
+    # answer is already in hand (T-02-01).
+    zoom_val: int | str = "unsupported"
+    if gate(handle, "zoom"):
+        try:
+            zoom_val = host.get_zoom(ch)
+        except Exception as exc:
+            logger.debug("camera '%s' zoom read failed: %r", camera, exc)
+            zoom_val = "unavailable"
 
     at_preset = None
     for preset_id, (cached_pan, cached_tilt) in handle.preset_positions.items():

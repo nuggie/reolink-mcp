@@ -701,6 +701,55 @@ async def test_set_zoom_host_error_translated_to_camera_error(
     assert "set_zoom" not in str(exc_info.value) or "rejected" in str(exc_info.value)
 
 
+async def test_set_zoom_unpopulated_range_read_translated_to_camera_error(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    """WR-02: zoom_range() is a bare dict index in reolink-aio — it raises
+    KeyError when _zoom_focus_settings was never populated, a condition the
+    zoom gate does not preclude. The raw KeyError must never escape."""
+    host = mock_host_factory()
+    _configure_zoom_capable(host)
+
+    def unpopulated_zoom_range(channel):
+        raise KeyError(channel)
+
+    host.zoom_range = unpopulated_zoom_range
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    with pytest.raises(CameraError) as exc_info:
+        await set_zoom("front_door", _fake_ctx(manager), position=50)
+
+    assert "KeyError" not in str(exc_info.value)
+    assert "front_door" in str(exc_info.value)
+    host.set_zoom.assert_not_awaited()
+
+
+async def test_set_zoom_step_current_read_error_translated_to_camera_error(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    """WR-02: the relative-step path's get_zoom() read raises
+    InvalidParameterError when the settings cache is empty — must surface as
+    a curated, prefix-stripped CameraError, never the raw library text."""
+    host = mock_host_factory()
+    _configure_zoom_capable(host)
+
+    def failing_get_zoom(channel):
+        raise InvalidParameterError("get_zoom: no ZoomFocus data for channel 0")
+
+    host.get_zoom = failing_get_zoom
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    with pytest.raises(CameraError) as exc_info:
+        await set_zoom("front_door", _fake_ctx(manager), step=1)
+
+    msg = str(exc_info.value)
+    assert "rejected" in msg
+    assert "get_zoom:" not in msg  # func_name prefix must be stripped
+    host.set_zoom.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # list_presets (CTRL-06, Pattern 1)
 # ---------------------------------------------------------------------------
@@ -940,6 +989,29 @@ async def test_ptz_position_zoom_field_is_unsupported_when_zoom_not_gated(
     result = await ptz_position("front_door", _fake_ctx(manager))
 
     assert result["zoom"] == "unsupported"
+
+
+async def test_ptz_position_zoom_read_failure_degrades_to_unavailable(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    """WR-02: a gated-supported but unpopulated zoom read degrades to
+    "unavailable" — the pan/tilt answer is already in hand, and the raw
+    library text must never escape to the client."""
+    host = mock_host_factory()
+    _configure_pan_tilt_capable(host, extra_supported={"zoom": True}, pan=1, tilt=2)
+
+    def failing_get_zoom(channel):
+        raise InvalidParameterError("get_zoom: no ZoomFocus data for channel 0")
+
+    host.get_zoom = failing_get_zoom
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    result = await ptz_position("front_door", _fake_ctx(manager))
+
+    assert result["zoom"] == "unavailable"
+    assert result["pan"] == 1
+    assert result["tilt"] == 2
 
 
 async def test_ptz_position_gate_failure_refuses_without_awaiting(

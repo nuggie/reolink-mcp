@@ -21,13 +21,19 @@ covering all nine control tools:
                        capability — the project's acknowledged no-hardware
                        gap
   6. siren (LAST)     — the one interactive, physically loud check (D-16):
-                       requires an explicit human confirmation immediately
-                       before the one ~2s audible burst, times the API
-                       round-trip with a stopwatch, and asks the operator to
-                       report the perceived real-world duration — resolving
-                       Pitfall 1/Assumption A1's `duration` units ambiguity
-                       against reality. The siren is unconditionally stopped
-                       afterward regardless of outcome.
+                       first preflights `get_states`' `audio_alarm_enabled`
+                       (a disabled audio alarm silently suppresses the siren
+                       — the live-QA discovery behind `set_audio_alarm`) and
+                       offers to enable it; then requires an explicit human
+                       confirmation immediately before the one ~2s audible
+                       burst, times the API round-trip with a stopwatch, and
+                       asks the operator to report the perceived real-world
+                       duration — resolving Pitfall 1/Assumption A1's
+                       `duration` units ambiguity against reality. A
+                       perceived duration under 1s (silent siren) or over
+                       double the requested 2s is a FAIL. The siren is
+                       unconditionally stopped afterward regardless of
+                       outcome.
 
 Every mutating check issues its camera-facing call via
 `await session.call_tool("set_...", {...})` inside a fresh `with_session(...)`
@@ -453,6 +459,45 @@ async def check_siren(env: dict[str, str], names: list[str]) -> bool:
         print("  [SKIP] no siren-capable camera configured")
         return True
 
+    # Silent-siren preflight (WR-03): a camera whose audio-alarm feature is
+    # disabled ACCEPTS set_siren commands but produces NO sound — the exact
+    # failure mode live Phase 3 QA hit (the discovery that forced the
+    # set_audio_alarm checkpoint deviation). Check it before burning the one
+    # audible burst on guaranteed silence.
+    async def call_states(session):
+        args = {"camera": siren_name, "refresh": True, "full": True}
+        return await session.call_tool("get_states", args)
+
+    states, err = await _call_tool(env, call_states, "get_states")
+    if err:
+        print(
+            f"  [WARNING] audio-alarm preflight failed ({err}) — proceeding, "
+            f"but an inaudible burst below is a FAIL"
+        )
+    elif (states or {}).get("audio_alarm_enabled") is False:
+        print(
+            f"  [WARNING] {siren_name} has audio_alarm_enabled=false — set_siren "
+            f"will be accepted by the firmware but produce NO sound (the "
+            f"silent-siren failure live QA already hit once)."
+        )
+        answer = input("Enable it now via set_audio_alarm? [Y/n]: ").strip().lower()
+        if answer in ("", "y", "yes"):
+
+            async def call_enable(session):
+                args = {"camera": siren_name, "enabled": True}
+                return await session.call_tool("set_audio_alarm", args)
+
+            enabled, err = await _call_tool(env, call_enable, "set_audio_alarm")
+            if err:
+                print(f"  [{FAIL}] {siren_name} set_audio_alarm: {err}")
+                return False
+            print(f"  [info] set_audio_alarm read-back: {enabled}")
+        else:
+            print(
+                "  [info] proceeding with the audio alarm disabled — the "
+                "burst below is expected to be silent and will FAIL"
+            )
+
     print(
         f"\nAbout to sound the siren on {siren_name} for ~2s. This produces a "
         f"REAL AUDIBLE SOUND."
@@ -499,13 +544,22 @@ async def check_siren(env: dict[str, str], names: list[str]) -> bool:
 
     if perceived is not None:
         print(f"  [info] requested 2s, operator reported {perceived}s")
+        if perceived < 1:
+            print(
+                f"  [{FAIL}] {siren_name}: perceived duration {perceived}s — "
+                f"the siren was effectively inaudible (the silent-siren "
+                f"failure mode); check get_states' audio_alarm_enabled and "
+                f"re-run after set_audio_alarm"
+            )
+            return False
         if perceived > 2 * 2:
             print(
-                f"  [WARNING] perceived siren duration ({perceived}s) is more than "
+                f"  [{FAIL}] perceived siren duration ({perceived}s) is more than "
                 f"double the requested 2s — may confirm reolink-aio's internal "
                 f"'times * 5' bookkeeping means duration is NOT literal seconds "
                 f"(Pitfall 1/Assumption A1) — flag for launch review"
             )
+            return False
 
     print(f"  [{PASS}] {siren_name}: siren check complete, siren stopped")
     return True

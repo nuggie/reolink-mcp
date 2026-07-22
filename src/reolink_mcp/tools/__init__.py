@@ -26,6 +26,7 @@ from reolink_mcp.tools.control import (
     ptz_guard,
     ptz_move,
     ptz_move_to_preset,
+    ptz_patrol,
     ptz_position,
     save_preset,
     set_audio_alarm,
@@ -152,5 +153,10 @@ def register_all(mcp: FastMCP, read_only: bool = False) -> None:
                 readOnlyHint=False, destructiveHint=False, idempotentHint=True
             )
         )(ptz_guard)
+        mcp.tool(
+            annotations=ToolAnnotations(
+                readOnlyHint=False, destructiveHint=False, idempotentHint=True
+            )
+        )(ptz_patrol)
     else:
-        logger.warning("read-only mode: %d control tools disabled", 12)
+        logger.warning("read-only mode: %d control tools disabled", 13)

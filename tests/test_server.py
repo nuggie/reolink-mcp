@@ -54,6 +54,6 @@ async def test_read_only_unset_registers_control_tools_at_real_import(
     # (Phase 3 Plan 1) + set_zoom/list_presets/ptz_move_to_preset/
     # ptz_position (Phase 3 Plan 2) + ptz_guard (Phase 3 Plan 3) +
     # set_audio_alarm (Plan 03-03 checkpoint deviation) + ptz_move (locally-
-    # maintained fork addition) — all 11 control tools registered, the
-    # complete 17-tool registry.
-    assert len(tools) == 17
+    # maintained fork addition) — all 12 control tools registered, the
+    # complete 18-tool registry.
+    assert len(tools) == 18

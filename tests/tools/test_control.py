@@ -32,6 +32,7 @@ from reolink_mcp.tools.control import (
     ptz_move,
     ptz_move_to_preset,
     ptz_position,
+    save_preset,
     set_audio_alarm,
     set_ir_lights,
     set_siren,
@@ -40,15 +41,17 @@ from reolink_mcp.tools.control import (
     set_zoom,
 )
 
-# Plan 03-03 Task 1 (+ checkpoint deviation): the full, final 17-tool
-# registry (6 observe + 11 control) — the literal name sets SAFE-01/SAFE-02's
+# Plan 03-03 Task 1 (+ checkpoint deviation): the full, final 18-tool
+# registry (6 observe + 12 control) — the literal name sets SAFE-01/SAFE-02's
 # hard regression tests assert against, defined once here to avoid drift
 # between the two tests. `set_audio_alarm` was added during the Plan 03-03
 # hardware checkpoint after live P437 QA found `set_siren` silently
 # suppressed while the camera's audio-alarm feature is disabled. `ptz_move`
 # (raw directional pan/tilt, distinct from the fixed-target
-# `ptz_move_to_preset`) was added later as a locally-maintained fork addition.
-_ALL_SEVENTEEN_TOOL_NAMES = {
+# `ptz_move_to_preset`) and `save_preset` (the write-side counterpart to
+# `ptz_move_to_preset`/`list_presets`) were added later as locally-maintained
+# fork additions.
+_ALL_EIGHTEEN_TOOL_NAMES = {
     "list_cameras",
     "get_snapshot",
     "get_device_info",
@@ -62,6 +65,7 @@ _ALL_SEVENTEEN_TOOL_NAMES = {
     "set_white_led",
     "set_zoom",
     "list_presets",
+    "save_preset",
     "ptz_move_to_preset",
     "ptz_move",
     "ptz_position",
@@ -809,6 +813,147 @@ async def test_list_presets_gate_failure_refuses(
 
 
 # ---------------------------------------------------------------------------
+# save_preset (write-side counterpart to list_presets/ptz_move_to_preset,
+# locally-maintained fork addition)
+# ---------------------------------------------------------------------------
+
+
+async def test_save_preset_auto_id_uses_max_existing_plus_one(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_ptz_presets_capable(host, {"driveway": 1, "gate": 2})
+    host.send_setting = AsyncMock()
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    result = await save_preset("front_door", _fake_ctx(manager), name="pool")
+
+    host.send_setting.assert_awaited_once_with(
+        [
+            {
+                "cmd": "SetPtzPreset",
+                "action": 0,
+                "param": {
+                    "PtzPreset": {"channel": 0, "enable": 1, "id": 3, "name": "pool"}
+                },
+            }
+        ]
+    )
+    assert result["id"] == 3
+    assert result["preset"] == "pool"
+
+
+async def test_save_preset_no_existing_presets_uses_id_one(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_ptz_presets_capable(host, {})
+    host.send_setting = AsyncMock()
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    result = await save_preset("front_door", _fake_ctx(manager), name="pool")
+
+    assert result["id"] == 1
+
+
+async def test_save_preset_explicit_id_used_verbatim(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_ptz_presets_capable(host, {"driveway": 1, "gate": 2})
+    host.send_setting = AsyncMock()
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    result = await save_preset(
+        "front_door", _fake_ctx(manager), name="pool", preset_id=10
+    )
+
+    host.send_setting.assert_awaited_once_with(
+        [
+            {
+                "cmd": "SetPtzPreset",
+                "action": 0,
+                "param": {
+                    "PtzPreset": {"channel": 0, "enable": 1, "id": 10, "name": "pool"}
+                },
+            }
+        ]
+    )
+    assert result["id"] == 10
+
+
+async def test_save_preset_name_collision_refused_never_sent(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_ptz_presets_capable(host, {"driveway": 1, "pool": 2})
+    host.send_setting = AsyncMock()
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    with pytest.raises(CameraError) as exc_info:
+        await save_preset("front_door", _fake_ctx(manager), name="pool")
+
+    assert "pool" in str(exc_info.value)
+    assert "already has a preset" in str(exc_info.value)
+    host.send_setting.assert_not_awaited()
+
+
+async def test_save_preset_id_collision_refused_never_sent(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_ptz_presets_capable(host, {"driveway": 1, "gate": 2})
+    host.send_setting = AsyncMock()
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    with pytest.raises(CameraError) as exc_info:
+        await save_preset(
+            "front_door", _fake_ctx(manager), name="pool", preset_id=2
+        )
+
+    assert "gate" in str(exc_info.value)
+    host.send_setting.assert_not_awaited()
+
+
+async def test_save_preset_gate_failure_refuses_without_awaiting(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    host.supported = _per_string_supported({"ptz_presets": False})
+    host.send_setting = AsyncMock()
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    with pytest.raises(CameraError) as exc_info:
+        await save_preset("front_door", _fake_ctx(manager), name="pool")
+
+    assert refusal_message("front_door", "ptz_presets") in str(exc_info.value)
+    host.send_setting.assert_not_awaited()
+
+
+async def test_save_preset_host_error_translated_to_camera_error(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_ptz_presets_capable(host, {})
+    host.send_setting = AsyncMock(
+        side_effect=ReolinkConnectionError("baichuan header: deadbeefcafe")
+    )
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    with pytest.raises(CameraError) as exc_info:
+        await save_preset("front_door", _fake_ctx(manager), name="pool")
+
+    assert "deadbeefcafe" not in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
 # ptz_move_to_preset (D-09, D-12, Pattern 4/5)
 # ---------------------------------------------------------------------------
 
@@ -1413,13 +1558,13 @@ async def test_ptz_guard_host_error_translated_to_camera_error(
 # ---------------------------------------------------------------------------
 
 
-async def test_register_all_not_read_only_registers_seventeen_tools():
+async def test_register_all_not_read_only_registers_eighteen_tools():
     test_mcp = FastMCP("probe-annotations")
     register_all(test_mcp, read_only=False)
 
     tools = await test_mcp.list_tools()
 
-    assert len(tools) == 17
+    assert len(tools) == 18
     names = {t.name for t in tools}
     assert {
         "set_siren",
@@ -1429,6 +1574,7 @@ async def test_register_all_not_read_only_registers_seventeen_tools():
         "set_white_led",
         "set_zoom",
         "list_presets",
+        "save_preset",
         "ptz_move_to_preset",
         "ptz_move",
         "ptz_position",
@@ -1452,6 +1598,7 @@ async def test_register_all_read_only_registers_six_tools_no_control_tools():
         "set_white_led",
         "set_zoom",
         "list_presets",
+        "save_preset",
         "ptz_move_to_preset",
         "ptz_move",
         "ptz_position",
@@ -1472,12 +1619,12 @@ async def test_register_all_exact_tool_name_sets_for_both_modes():
     register_all(read_only_mcp, read_only=True)
     read_only_names = {t.name for t in await read_only_mcp.list_tools()}
 
-    assert full_names == _ALL_SEVENTEEN_TOOL_NAMES
+    assert full_names == _ALL_EIGHTEEN_TOOL_NAMES
     assert read_only_names == _SIX_OBSERVE_TOOL_NAMES
 
 
 async def test_full_registry_annotation_completeness_and_d13_matrix():
-    """SAFE-01 hard regression guard: every one of the 17 registered tools
+    """SAFE-01 hard regression guard: every one of the 18 registered tools
     (not a spot-check subset) must carry explicit, non-None
     readOnlyHint/destructiveHint/idempotentHint values, plus the D-13
     matrix invariants (destructiveHint True on set_siren only; readOnlyHint
@@ -1486,7 +1633,7 @@ async def test_full_registry_annotation_completeness_and_d13_matrix():
     register_all(test_mcp, read_only=False)
     tools = await test_mcp.list_tools()
 
-    assert {t.name for t in tools} == _ALL_SEVENTEEN_TOOL_NAMES
+    assert {t.name for t in tools} == _ALL_EIGHTEEN_TOOL_NAMES
 
     for tool in tools:
         assert tool.annotations is not None, f"{tool.name} missing annotations"
@@ -1580,6 +1727,19 @@ async def test_ptz_move_registered_with_idempotent_hint_false():
 
     tools = await test_mcp.list_tools()
     tool = next(t for t in tools if t.name == "ptz_move")
+
+    assert tool.annotations is not None
+    assert tool.annotations.readOnlyHint is False
+    assert tool.annotations.destructiveHint is False
+    assert tool.annotations.idempotentHint is False
+
+
+async def test_save_preset_registered_with_idempotent_hint_false():
+    test_mcp = FastMCP("probe-annotations")
+    register_all(test_mcp, read_only=False)
+
+    tools = await test_mcp.list_tools()
+    tool = next(t for t in tools if t.name == "save_preset")
 
     assert tool.annotations is not None
     assert tool.annotations.readOnlyHint is False

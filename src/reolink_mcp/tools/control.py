@@ -374,6 +374,93 @@ async def list_presets(camera: str, ctx: Context) -> dict[str, Any]:
     return {"camera": camera, "presets": host.ptz_presets(ch)}
 
 
+async def save_preset(
+    camera: str,
+    ctx: Context,
+    name: str,
+    preset_id: int | None = None,
+) -> dict[str, Any]:
+    """Save `camera`'s CURRENT physical pan/tilt/zoom as a new named PTZ
+    preset — the counterpart to `ptz_move_to_preset` (which only reaches
+    *existing* presets).
+
+    `SetPtzPreset` takes no pan/tilt/zoom in its body (mirroring
+    `GetPtzPreset`, which also never exposes position — Pattern 1/CTRL-06):
+    the camera captures whatever its physical PTZ state happens to be at the
+    moment it receives the command, invisibly on the camera side. Reposition
+    the camera first (`ptz_move`/`ptz_move_to_preset`/manual nudges), then
+    call this to bookmark it.
+
+    Refuses, never overwrites, on either kind of collision: `name` already
+    present in `host.ptz_presets(ch)`, or an explicitly-given `preset_id`
+    already in use by another name — both checked before any host call. With
+    no `preset_id`, one is chosen automatically as `max(existing ids) + 1`
+    (matching how the camera's own app assigns new preset slots).
+
+    Unlike the PTZ movement tools, no settle-wait + Baichuan re-poll is
+    needed here: `SetPtzPreset` starts with `"Set"`, so `send_setting()`'s
+    own auto-refetch (Set->Get command-name derivation) already re-issues
+    `GetPtzPreset` and refreshes `host.ptz_presets(ch)` before this returns
+    (D-14 — same discipline as the lights/zoom read-backs, not the PtzCtrl
+    exception `ptz_move_to_preset`/`ptz_move` need)."""
+    manager = ctx.request_context.lifespan_context.manager
+    handle = await manager.get(camera)
+    if not gate(handle, "ptz_presets"):
+        raise CameraError(refusal_message(camera, "ptz_presets"))
+    host, ch = handle.host, handle.channel
+
+    presets = host.ptz_presets(ch)
+    if name in presets:
+        raise CameraError(
+            f"camera '{camera}' already has a preset named '{name}' (id "
+            f"{presets[name]}) — pick a different name, or delete/overwrite "
+            f"it via the camera's own app first"
+        )
+
+    if preset_id is None:
+        resolved_id = max(presets.values(), default=0) + 1
+    else:
+        existing_name = next(
+            (n for n, i in presets.items() if i == preset_id), None
+        )
+        if existing_name is not None:
+            raise CameraError(
+                f"camera '{camera}' preset id {preset_id} is already used by "
+                f"'{existing_name}' — pick a different id, or delete/"
+                f"overwrite it via the camera's own app first"
+            )
+        resolved_id = preset_id
+
+    try:
+        await host.send_setting(
+            [
+                {
+                    "cmd": "SetPtzPreset",
+                    "action": 0,
+                    "param": {
+                        "PtzPreset": {
+                            "channel": ch,
+                            "enable": 1,
+                            "id": resolved_id,
+                            "name": name,
+                        }
+                    },
+                }
+            ]
+        )
+    except Exception as exc:
+        raise CameraError(
+            classify_control_error(exc, camera, manager.configured_host(camera))
+        ) from exc
+
+    return {
+        "camera": camera,
+        "preset": name,
+        "id": resolved_id,
+        "presets": host.ptz_presets(ch),
+    }
+
+
 async def ptz_move_to_preset(
     camera: str, ctx: Context, preset: str | int
 ) -> dict[str, Any]:

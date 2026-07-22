@@ -383,15 +383,32 @@ async def set_zoom(
 async def list_presets(camera: str, ctx: Context) -> dict[str, Any]:
     """List `camera`'s named PTZ presets (CTRL-06).
 
-    `host.ptz_presets(ch)` is already populated at connect time (Pattern 1 —
-    `get_host_data()`'s second internal round-trip includes `GetPtzPreset`
-    whenever `ptz_preset_basic` is supported) — a pure, synchronous read,
-    zero extra host I/O beyond the manager's own connect."""
+    Forces a fresh `GetPtzPreset` poll on every call rather than trusting
+    `host.ptz_presets(ch)`'s cached value as-is. `CameraManager` keeps one
+    `Host` alive for the whole server process (manager.py's Pattern 1) —
+    on a long-lived process, presets added/renamed/deleted out-of-band
+    (the camera's own app, `save_preset`, a different MCP session) can end
+    up invisible for the rest of that process's lifetime otherwise.
+    Confirmed live (2026-07-22/23): a preset `save_preset` had just created
+    on THIS SAME already-connected `Host` stayed absent from `list_presets`
+    indefinitely until this explicit re-poll was added — the `send_setting`
+    Set->Get auto-refetch other tools rely on (D-14) did not reliably
+    propagate here for reasons not fully root-caused; re-fetching
+    unconditionally is the robust fix regardless of the exact cause. The
+    extra round-trip is one lightweight command, not the 20-command
+    connect-time batch (abseite's timeout failure mode)."""
     manager = ctx.request_context.lifespan_context.manager
     handle = await manager.get(camera)
     if not gate(handle, "ptz_presets"):
         raise CameraError(refusal_message(camera, "ptz_presets"))
     host, ch = handle.host, handle.channel
+
+    try:
+        await host.get_state(cmd="GetPtzPreset", ch=ch)
+    except Exception as exc:
+        raise CameraError(
+            classify_control_error(exc, camera, manager.configured_host(camera))
+        ) from exc
 
     return {"camera": camera, "presets": host.ptz_presets(ch)}
 
@@ -474,6 +491,28 @@ async def save_preset(
         raise CameraError(
             classify_control_error(exc, camera, manager.configured_host(camera))
         ) from exc
+
+    # Belt-and-braces explicit re-poll, same rationale as list_presets: the
+    # camera-side save above already succeeded (confirmed live — the raw
+    # SetPtzPreset response code was 0/200), so a failure here degrades
+    # instead of raising — never claim the save itself failed over a
+    # read-back hiccup.
+    try:
+        await host.get_state(cmd="GetPtzPreset", ch=ch)
+    except Exception as exc:
+        logger.debug(
+            "camera '%s' post-save-preset re-poll failed: %r", camera, exc
+        )
+        return {
+            "camera": camera,
+            "preset": name,
+            "id": resolved_id,
+            "presets": presets,
+            "note": (
+                "preset save succeeded, but the post-save presets re-poll "
+                "failed — call list_presets to confirm"
+            ),
+        }
 
     return {
         "camera": camera,

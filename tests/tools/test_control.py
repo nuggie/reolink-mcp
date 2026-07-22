@@ -133,6 +133,7 @@ def _configure_ptz_presets_capable(host, presets: dict[str, int]) -> None:
     host.set_ptz_command = AsyncMock()
     host.ptz_pan_position = lambda channel: None
     host.ptz_tilt_position = lambda channel: None
+    host.get_state = AsyncMock()
 
 
 def _configure_pan_tilt_capable(
@@ -780,22 +781,41 @@ async def test_set_zoom_step_current_read_error_translated_to_camera_error(
 # ---------------------------------------------------------------------------
 
 
-async def test_list_presets_returns_presets_with_zero_extra_io(
+async def test_list_presets_forces_fresh_getptzpreset_poll(
     mock_host_factory, camera_config_factory, manager_factory
 ):
     host = mock_host_factory()
     _configure_ptz_presets_capable(host, {"driveway": 1, "gate": 2})
+    host.get_state = AsyncMock()
     cameras = {"front_door": camera_config_factory()}
     manager = manager_factory(cameras, host)
 
     result = await list_presets("front_door", _fake_ctx(manager))
 
+    host.get_state.assert_awaited_once_with(cmd="GetPtzPreset", ch=0)
     assert result == {
         "camera": "front_door",
         "presets": {"driveway": 1, "gate": 2},
     }
     host.set_ptz_command.assert_not_awaited()
     host.baichuan.get_ptz_position.assert_not_awaited()
+
+
+async def test_list_presets_poll_failure_translated_to_camera_error(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_ptz_presets_capable(host, {"driveway": 1})
+    host.get_state = AsyncMock(
+        side_effect=ReolinkConnectionError("baichuan header: deadbeefcafe")
+    )
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    with pytest.raises(CameraError) as exc_info:
+        await list_presets("front_door", _fake_ctx(manager))
+
+    assert "deadbeefcafe" not in str(exc_info.value)
 
 
 async def test_list_presets_gate_failure_refuses(
@@ -951,6 +971,44 @@ async def test_save_preset_host_error_translated_to_camera_error(
         await save_preset("front_door", _fake_ctx(manager), name="pool")
 
     assert "deadbeefcafe" not in str(exc_info.value)
+
+
+async def test_save_preset_forces_fresh_getptzpreset_poll_after_save(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_ptz_presets_capable(host, {"driveway": 1})
+    host.send_setting = AsyncMock()
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    await save_preset("front_door", _fake_ctx(manager), name="pool")
+
+    host.get_state.assert_awaited_once_with(cmd="GetPtzPreset", ch=0)
+
+
+async def test_save_preset_repoll_failure_degrades_never_raises(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    """The camera-side save already succeeded (SetPtzPreset returned
+    success) — a failed post-save re-poll must degrade with a note, never
+    make the call look like the save itself failed, and never leak raw
+    exception text."""
+    host = mock_host_factory()
+    _configure_ptz_presets_capable(host, {"driveway": 1})
+    host.send_setting = AsyncMock()
+    host.get_state = AsyncMock(
+        side_effect=ReolinkConnectionError("baichuan header: deadbeefcafe")
+    )
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    result = await save_preset("front_door", _fake_ctx(manager), name="pool")
+
+    assert result["preset"] == "pool"
+    assert result["id"] == 2
+    assert "re-poll" in result["note"]
+    assert "deadbeefcafe" not in str(result)
 
 
 # ---------------------------------------------------------------------------

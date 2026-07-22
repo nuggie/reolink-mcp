@@ -396,6 +396,7 @@ async def save_preset(
     ctx: Context,
     name: str,
     preset_id: int | None = None,
+    overwrite: bool = False,
 ) -> dict[str, Any]:
     """Save `camera`'s CURRENT physical pan/tilt/zoom as a new named PTZ
     preset — the counterpart to `ptz_move_to_preset` (which only reaches
@@ -408,11 +409,19 @@ async def save_preset(
     the camera first (`ptz_move`/`ptz_move_to_preset`/manual nudges), then
     call this to bookmark it.
 
-    Refuses, never overwrites, on either kind of collision: `name` already
-    present in `host.ptz_presets(ch)`, or an explicitly-given `preset_id`
-    already in use by another name — both checked before any host call. With
-    no `preset_id`, one is chosen automatically as `max(existing ids) + 1`
+    Refuses on either kind of collision by default: `name` already present
+    in `host.ptz_presets(ch)`, or an explicitly-given `preset_id` already in
+    use by another name — both checked before any host call. With no
+    `preset_id`, one is chosen automatically as `max(existing ids) + 1`
     (matching how the camera's own app assigns new preset slots).
+
+    `overwrite=True` is the deliberate-update escape hatch for the name
+    collision: re-saves `name`'s position under its EXISTING id instead of
+    refusing (e.g. re-centering a preset after nudging the camera).
+    `preset_id` is ignored in that path — the existing id is always reused,
+    never reassigned — and the id-collision-with-a-different-name refusal
+    still applies even with `overwrite=True`: this tool updates one named
+    preset's position, it does not reassign preset slots between names.
 
     Unlike the PTZ movement tools, no settle-wait + Baichuan re-poll is
     needed here: `SetPtzPreset` starts with `"Set"`, so `send_setting()`'s
@@ -428,13 +437,14 @@ async def save_preset(
 
     presets = host.ptz_presets(ch)
     if name in presets:
-        raise CameraError(
-            f"camera '{camera}' already has a preset named '{name}' (id "
-            f"{presets[name]}) — pick a different name, or delete/overwrite "
-            f"it via the camera's own app first"
-        )
-
-    if preset_id is None:
+        if not overwrite:
+            raise CameraError(
+                f"camera '{camera}' already has a preset named '{name}' (id "
+                f"{presets[name]}) — pass overwrite=True to update its "
+                f"position, or pick a different name"
+            )
+        resolved_id = presets[name]
+    elif preset_id is None:
         resolved_id = max(presets.values(), default=0) + 1
     else:
         existing_name = next(

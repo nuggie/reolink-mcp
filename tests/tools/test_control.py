@@ -903,6 +903,91 @@ async def test_save_preset_name_collision_refused_never_sent(
     host.send_setting.assert_not_awaited()
 
 
+async def test_save_preset_overwrite_reuses_existing_id(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    host = mock_host_factory()
+    _configure_ptz_presets_capable(host, {"driveway": 1, "pool": 2})
+    host.send_setting = AsyncMock()
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    result = await save_preset(
+        "front_door", _fake_ctx(manager), name="pool", overwrite=True
+    )
+
+    host.send_setting.assert_awaited_once_with(
+        [
+            {
+                "cmd": "SetPtzPreset",
+                "action": 0,
+                "param": {
+                    "PtzPreset": {"channel": 0, "enable": 1, "id": 2, "name": "pool"}
+                },
+            }
+        ]
+    )
+    assert result["id"] == 2
+
+
+async def test_save_preset_overwrite_ignores_given_preset_id(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    """overwrite=True always reuses the EXISTING id for `name` — a
+    conflicting explicit `preset_id` is silently ignored, never used to
+    reassign the slot."""
+    host = mock_host_factory()
+    _configure_ptz_presets_capable(host, {"driveway": 1, "pool": 2})
+    host.send_setting = AsyncMock()
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    result = await save_preset(
+        "front_door", _fake_ctx(manager), name="pool", preset_id=99, overwrite=True
+    )
+
+    assert result["id"] == 2
+
+
+async def test_save_preset_overwrite_true_with_new_name_behaves_like_default(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    """overwrite=True is a no-op modifier when `name` doesn't collide —
+    still auto-assigns the next id, same as the default path."""
+    host = mock_host_factory()
+    _configure_ptz_presets_capable(host, {"driveway": 1, "gate": 2})
+    host.send_setting = AsyncMock()
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    result = await save_preset(
+        "front_door", _fake_ctx(manager), name="pool", overwrite=True
+    )
+
+    assert result["id"] == 3
+
+
+async def test_save_preset_id_collision_still_refused_with_overwrite_true(
+    mock_host_factory, camera_config_factory, manager_factory
+):
+    """`overwrite=True` only unlocks the NAME-collision path — an explicit
+    `preset_id` colliding with a DIFFERENT name is still refused, since
+    that would reassign a slot rather than update `name`'s own position."""
+    host = mock_host_factory()
+    _configure_ptz_presets_capable(host, {"driveway": 1, "gate": 2})
+    host.send_setting = AsyncMock()
+    cameras = {"front_door": camera_config_factory()}
+    manager = manager_factory(cameras, host)
+
+    with pytest.raises(CameraError) as exc_info:
+        await save_preset(
+            "front_door", _fake_ctx(manager), name="pool", preset_id=2, overwrite=True
+        )
+
+    assert "gate" in str(exc_info.value)
+    host.send_setting.assert_not_awaited()
+
+
 async def test_save_preset_id_collision_refused_never_sent(
     mock_host_factory, camera_config_factory, manager_factory
 ):
